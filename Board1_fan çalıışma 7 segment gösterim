@@ -1,0 +1,568 @@
+; =====================================================
+; AKILLI EV – BOARD 1 (DISPLAY SCAN FIX)
+; =====================================================
+
+#include <xc.inc>
+
+; ---------------- CONFIG ----------------
+CONFIG FOSC = HS
+CONFIG WDTE = OFF
+CONFIG PWRTE = ON
+CONFIG BOREN = ON
+CONFIG LVP = OFF
+CONFIG CPD = OFF
+CONFIG WRT = OFF
+CONFIG CP = OFF
+
+; ---------------- RAM ----------------
+PSECT udata_shr
+W_TEMP:         DS 1
+STATUS_TEMP:    DS 1
+DIGIT_TEMP:     DS 1    ; Tarama için geçici saklama
+; RAM bloğuna ekle:
+ENTRY_MODE:     DS 1    ; 1 ise tuş takımı giriş modundayız demektir
+KEY_VAL:        DS 1    ; Basılan tuşun değeri
+
+PSECT udata_bank0
+DIGIT_VAR:      DS 1
+DISP1:          DS 1    ; Onlar
+DISP2:          DS 1    ; Birler
+DISP3:          DS 1    ; Ondalık
+DISP4:          DS 1    ; C Harfi
+TEMP_RAW:       DS 1
+TEMP_CALIB:     DS 1
+TEMP_OFFSET:    DS 1
+ADC_LOW:        DS 1
+
+; ---------------- RESET ----------------
+PSECT code, delta=2, abs
+ORG 0x0000
+    GOTO MAIN
+
+; ---------------- INTERRUPT ----------------
+PSECT code, delta=2, abs
+ORG 0x0004
+ISR:
+    ; Context Saving (Değişkenleri sakla)
+    MOVWF   W_TEMP
+    SWAPF   STATUS, W
+    MOVWF   STATUS_TEMP
+
+    ; --- KESME KAYNAĞI KONTROLÜ ---
+    
+    ; 1. KEYPAD KESMESİ Mİ? (RB0/INTF)
+    BTFSC   INTCON, 1       ; INTF biti 1 mi?
+    GOTO    KEYPAD_ISR      ; Evet, tuşa basıldı!
+
+    ; 2. TIMER KESMESİ Mİ? (T0IF)
+    BTFSC   INTCON, 2       ; T0IF biti 1 mi?
+    GOTO    DISPLAY_ISR     ; Evet, ekranı tazele
+
+    GOTO    EXIT_ISR        ; Bilinmeyen kesme, çık.
+
+KEYPAD_ISR:
+    BCF     INTCON, 1       ; INTF bayrağını temizle (Sonsuz döngüye girmesin)
+    BSF     ENTRY_MODE, 0   ; "Veri Giriş Modu" bayrağını 1 yap (Bunu RAM'de tanımlayacağız)
+    GOTO    EXIT_ISR
+
+DISPLAY_ISR:
+    BCF     INTCON, 2       ; T0IF temizle
+    CALL    REFRESH_DISPLAY ; Senin mevcut ekran kodun
+    MOVLW   100
+    MOVWF   TMR0
+    GOTO    EXIT_ISR
+
+EXIT_ISR:
+    SWAPF   STATUS_TEMP, W
+    MOVWF   STATUS
+    SWAPF   W_TEMP, F
+    SWAPF   W_TEMP, W
+    RETFIE
+
+; ---------------- 7-SEGMENT TABLOSU ----------------
+PSECT code, delta=2, abs
+ORG 0x0200
+
+GET_7SEG:
+    ANDLW   0x0F
+    ADDWF   PCL, F
+
+    ; Common Cathode (1 = YANAR)
+    RETLW   00111111B ; 0
+    RETLW   00000110B ; 1
+    RETLW   01011011B ; 2
+    RETLW   01001111B ; 3
+    RETLW   01100110B ; 4
+    RETLW   01101101B ; 5
+    RETLW   01111101B ; 6
+    RETLW   00000111B ; 7
+    RETLW   01111111B ; 8
+    RETLW   01101111B ; 9
+    RETLW   00111001B ; C (10)
+    RETLW   01100011B ; Derece (11)
+    RETLW   00000000B ; Boş
+
+; ---------------- MAIN ----------------
+PSECT code
+MAIN:
+    ; PORT AYARLARI
+    BANKSEL TRISD
+    CLRF    TRISD
+    CLRF    TRISE
+    CLRF    TRISA
+    BSF     TRISA, 0        ; RA0 Analog
+
+    ; ADC AYARI
+    MOVLW   10001110B       
+    MOVWF   ADCON1
+    BANKSEL ADCON0
+    MOVLW   10000001B       ; ADC Açık
+    MOVWF   ADCON0
+
+    ; TIMER AYARLARI
+    BANKSEL OPTION_REG
+    MOVLW   10000100B       ; Prescaler 1:32
+    MOVWF   OPTION_REG
+    BANKSEL INTCON
+    MOVLW   10100000B       ; Kesmeler Açık
+    MOVWF   INTCON
+
+    BANKSEL PORTD
+    CLRF    DIGIT_VAR
+    
+    MOVLW   10              ; 'C' harfi
+    MOVWF   DISP4
+    ; MAIN etiketinin hemen altına, PORT AYARLARI kısmına şunları ekle/değiştir:
+
+    ; ... TRISA ve TRISD ayarların aynen kalsın ...
+
+    ; KEYPAD PORT AYARLARI (PORTB)
+    BANKSEL TRISB
+    MOVLW   00001111B       ; RB0-RB3 Giriş (Satırlar), RB4-RB7 Çıkış (Sütunlar)
+    MOVWF   TRISB
+
+    ; OPTION_REG Ayarı (Pull-Up'ları Açmak İçin Önemli!)
+    BANKSEL OPTION_REG
+    ; Bit 7 (RBPU) = 0 olmalı (Pull-up açık)
+    ; Bit 6 (INTEDG) = 0 olmalı (Düşen kenar kesmesi - Tuşa basınca 0 olur)
+    MOVLW   00000000B       
+    MOVWF   OPTION_REG
+
+    BANKSEL PORTB
+    CLRF    PORTB           ; Sütunlara (RB4-RB7) 0 volt ver ki tuşa basınca RB0'ı toprağa çeksin.
+
+    ; KESME AYARLARI (Timer'a ek olarak INT (RB0) açıyoruz)
+    BANKSEL INTCON
+    BSF     INTCON, 4       ; INTE (RB0 Harici Kesme) Aç
+    BSF     INTCON, 7       ; GIE (Genel Kesme) Aç (Zaten açıktı ama garanti olsun)
+    ; ... Timer ayarların kalsın ...
+
+; RAM kısmına eklenecek değişken:
+DESIRED_TEMP:   DS 1    ; İstenen Sıcaklık (Şimdilik elle girilecek)
+
+; MAIN içinde, MAIN_LOOP'tan hemen önce bir varsayılan değer ver:
+    MOVLW   25          ; Hedef sıcaklık 25 derece olsun
+    MOVWF   DESIRED_TEMP
+
+MAIN_LOOP:
+    ; Ekran taraması zaten Interrupt içinde otomatik yapılıyor.
+    
+    ; Mod Kontrolü: A tuşuna basıldı mı? (ISR'de set edilmişti)
+    BTFSC   ENTRY_MODE, 0
+    CALL    GET_USER_INPUT 
+
+    CALL    READ_ADC        ; Normal çalışmaya devam
+    CALL    CHECK_SYSTEM    ; Klima kontrol
+    CALL    SPLIT_DIGITS    ; Ekranı hazırla
+    CALL    DELAY_SMALL
+    GOTO    MAIN_LOOP
+
+; -----------------------------------------------------------
+; KLİMA KONTROL MANTIĞI (CHECK_SYSTEM)
+; RC0 = Heater (Isıtıcı), RC1 = Cooler (Soğutucu)
+; Mantık:
+; Eğer Ortam < İstenen  -> Isıtıcı AÇ (Isınmalı)
+; Eğer Ortam > İstenen  -> Soğutucu AÇ (Soğumalı)
+; -----------------------------------------------------------
+    
+CHECK_SYSTEM:
+    BANKSEL TRISC
+    BCF     TRISC, 0    ; RC0 Çıkış yap
+    BCF     TRISC, 1    ; RC1 Çıkış yap
+    BANKSEL PORTC
+
+    ; Karşılaştırma: TEMP_RAW (Ortam) - DESIRED_TEMP (İstenen)
+    MOVF    DESIRED_TEMP, W
+    SUBWF   TEMP_RAW, W     ; W = TEMP_RAW - DESIRED_TEMP
+
+    ; Sonuç analizi (STATUS register'ın C ve Z bitleri)
+    BTFSC   STATUS, 2       ; Z=1 ise (Eşitse)
+    GOTO    ALL_OFF         ; Sıcaklık tam istenen değerde, ikisini de kapat
+
+    BTFSC   STATUS, 0       ; C=1 ise (Çıkarma sonucu pozitif, yani Ortam > İstenen)
+    GOTO    COOLER_ON       ; Ortam sıcak, soğutucu çalışsın
+
+    ; Buraya geldiyse C=0 (Sonuç negatif, yani Ortam < İstenen)
+    GOTO    HEATER_ON       ; Ortam soğuk, ısıtıcı çalışsın
+
+HEATER_ON:
+    BSF     PORTC, 0        ; Isıtıcı AÇ
+    BCF     PORTC, 1        ; Soğutucu KAPAT
+    RETURN
+
+COOLER_ON:
+    BCF     PORTC, 0        ; Isıtıcı KAPAT
+    BSF     PORTC, 1        ; Soğutucu AÇ
+    RETURN
+
+ALL_OFF:
+    BCF     PORTC, 0
+    BCF     PORTC, 1
+    RETURN
+
+; ---------------- ADC OKUMA & HESAP ----------------
+READ_ADC:
+    BANKSEL ADCON0
+    BSF     ADCON0, 2
+WAIT_ADC:
+    BTFSC   ADCON0, 2
+    GOTO    WAIT_ADC
+
+    BANKSEL ADRESL
+    MOVF    ADRESL, W
+    BANKSEL ADC_LOW
+    MOVWF   TEMP_RAW
+
+    ; Kalibrasyon (Değer - Değer/32)
+    MOVF    TEMP_RAW, W
+    MOVWF   TEMP_OFFSET
+    SWAPF   TEMP_OFFSET, F
+    MOVLW   0x0F
+    ANDWF   TEMP_OFFSET, F
+    BCF     STATUS, 0
+    RRF     TEMP_OFFSET, F
+    
+    MOVF    TEMP_OFFSET, W
+    SUBWF   TEMP_RAW, W
+    MOVWF   TEMP_CALIB
+
+    ; Tam Sayı
+    MOVF    TEMP_CALIB, W
+    MOVWF   TEMP_RAW
+    BCF     STATUS, 0
+    RRF     TEMP_RAW, F
+    
+    ; Ondalık Kısım (0 veya 5)
+    CLRF    DISP3           ; Önce 0 yap
+    BTFSC   TEMP_CALIB, 0   ; Tek sayı mı?
+    MOVLW   5               ; Evetse 5 yükle
+    BTFSC   TEMP_CALIB, 0
+    MOVWF   DISP3           ; Kaydet
+
+    RETURN
+
+; ---------------- BASAMAKLARA AYIRMA ----------------
+SPLIT_DIGITS:
+    CLRF    DISP1
+    MOVF    TEMP_RAW, W
+
+DIV10:
+    ADDLW   -10
+    BTFSS   STATUS, 0
+    GOTO    DONE_DIV
+    INCF    DISP1, F
+    GOTO    DIV10
+
+DONE_DIV:
+    ADDLW   10
+    MOVWF   DISP2
+    RETURN
+
+; ---------------- EKRAN TARAMA (DÜZELTİLDİ) ----------------
+REFRESH_DISPLAY:
+    ; Digitleri Kapat
+    BCF     PORTE, 0
+    BCF     PORTE, 1
+    BCF     PORTE, 2
+    BCF     PORTA, 5
+
+    MOVLW   0x02
+    MOVWF   PCLATH
+
+    ; --- YENİ SEÇME MANTIĞI (BUG FIX) ---
+    MOVF    DIGIT_VAR, W
+    ANDLW   0x03           ; Sadece 0-3 arası
+    MOVWF   DIGIT_TEMP     ; Sakla
+
+    ; 0 mı? (Onlar)
+    MOVF    DIGIT_TEMP, W
+    XORLW   0
+    BTFSC   STATUS, 2      ; Z=1 ise eşittir
+    GOTO    SHOW_1
+
+    ; 1 mi? (Birler)
+    MOVF    DIGIT_TEMP, W
+    XORLW   1
+    BTFSC   STATUS, 2
+    GOTO    SHOW_2
+
+    ; 2 mi? (Ondalık - SORUN BURADAYDI)
+    MOVF    DIGIT_TEMP, W
+    XORLW   2
+    BTFSC   STATUS, 2
+    GOTO    SHOW_3
+
+    ; 3 mü? (C harfi)
+    GOTO    SHOW_4
+
+SHOW_1: ; Onlar
+    MOVF    DISP1, W
+    CALL    GET_7SEG
+    MOVWF   PORTD
+    BSF     PORTE, 0
+    INCF    DIGIT_VAR, F
+    GOTO    FINISH
+
+SHOW_2: ; Birler + NOKTA
+    MOVF    DISP2, W
+    CALL    GET_7SEG
+    IORLW   10000000B      ; Noktayı yak
+    MOVWF   PORTD
+    BSF     PORTE, 1
+    INCF    DIGIT_VAR, F
+    GOTO    FINISH
+
+SHOW_3: ; Ondalık (Artık Çalışacak!)
+    MOVF    DISP3, W
+    CALL    GET_7SEG
+    MOVWF   PORTD
+    BSF     PORTE, 2       ; RE2'yi yak
+    INCF    DIGIT_VAR, F
+    GOTO    FINISH
+
+SHOW_4: ; C Harfi
+    MOVF    DISP4, W
+    CALL    GET_7SEG
+    MOVWF   PORTD
+    BSF     PORTA, 5
+    CLRF    DIGIT_VAR
+    GOTO    FINISH
+
+FINISH:
+    CLRF    PCLATH
+    RETURN
+
+; ... (Senin kodunun üst kısımları) ...
+
+; ---------------- GECİKME ----------------
+DELAY_SMALL:
+    MOVLW   50
+    MOVWF   W_TEMP
+DLY:
+    DECFSZ  W_TEMP, F
+    GOTO    DLY
+    RETURN
+
+; ---------------- KULLANICI VERİ GİRİŞİ ----------------
+
+GET_USER_INPUT:
+    ; --- DEBUG: A'ya basılınca anlaşılsın diye tüm noktaları yak ---
+    BANKSEL PORTD
+    BSF     PORTD, 7    ; DP (Nokta) pinini yak (veya senin bağlantına göre PORTD'nin ilgili biti)
+    ; ----------------------------------------------------------------
+    
+    ; 1. A Tuşunun bırakılmasını bekle
+WAIT_RELEASE_A:
+    CALL    SCAN_KEYPAD
+    XORLW   0xFF
+    BTFSS   STATUS, 2
+    GOTO    WAIT_RELEASE_A
+    
+    CLRF    DESIRED_TEMP ; Sıfırla
+
+    ; --- 1. RAKAMI BEKLE (ONLAR BASAMAĞI) ---
+WAIT_DIGIT_1:
+    CALL    SCAN_KEYPAD
+    MOVWF   KEY_VAL     ; Tuşu sakla
+    XORLW   0xFF
+    BTFSC   STATUS, 2   ; Tuş yoksa bekle
+    GOTO    WAIT_DIGIT_1
+    
+    ; Tuş bırakılana kadar bekle (Tekrar basmasın)
+    CALL    WAIT_RELEASE_KEY
+
+    ; Okunan değeri ASCII'den Sayıya çevir
+    MOVF    KEY_VAL, W
+    CALL    GET_KEY_CODE ; W şimdi '0'-'9' veya 'A'-'F' oldu
+    
+    ; Eğer '#' basıldıysa çık
+    XORLW   '#'
+    BTFSC   STATUS, 2
+    GOTO    FINISH_INPUT
+
+    ; Sayı mı? ('0'-'9')
+    MOVF    KEY_VAL, W
+    CALL    GET_KEY_CODE
+    SUBLW   '9'
+    BTFSS   STATUS, 0   ; C=0 ise sayı '9'dan büyüktür (Harftir)
+    GOTO    WAIT_DIGIT_1 ; Harfse yoksay
+
+    ; Sayıyı işle (ASCII -> Decimal)
+    MOVF    KEY_VAL, W
+    CALL    GET_KEY_CODE
+    ADDLW   -'0'        ; '5' (0x35) -> 5 (0x05)
+    MOVWF   DESIRED_TEMP
+    
+    ; Onlar basamağı olduğu için 10 ile çarp (x10)
+    ; (Basit çarpma: x2, x2... veya döngü ile)
+    ; Şimdilik sadece onlar basamağını kaydettik.
+
+    ; --- 2. RAKAMI BEKLE (BİRLER BASAMAĞI) ---
+WAIT_DIGIT_2:
+    CALL    SCAN_KEYPAD
+    MOVWF   KEY_VAL
+    XORLW   0xFF
+    BTFSC   STATUS, 2
+    GOTO    WAIT_DIGIT_2
+    
+    CALL    WAIT_RELEASE_KEY
+
+    ; '#' Kontrolü
+    MOVF    KEY_VAL, W
+    CALL    GET_KEY_CODE
+    XORLW   '#'
+    BTFSC   STATUS, 2
+    GOTO    FINISH_INPUT
+
+    ; Sayı dönüşümü
+    MOVF    KEY_VAL, W
+    CALL    GET_KEY_CODE
+    ADDLW   -'0'
+    MOVWF   W_TEMP       ; Birler basamağını sakla
+    
+    ; DESIRED_TEMP = (Onlar * 10) + Birler
+    ; Kolaylık olsun: Önceki rakamı DESIRED_TEMP'te tutuyorduk.
+    ; Onu 10 ile çarpalım.
+    MOVF    DESIRED_TEMP, W
+    MOVWF   STATUS_TEMP  ; Geçici sakla
+    BCF     STATUS, 0
+    RLF     DESIRED_TEMP, F ; x2
+    BCF     STATUS, 0
+    RLF     DESIRED_TEMP, F ; x4
+    ADDWF   DESIRED_TEMP, F ; x5 (x4 + x1)
+    BCF     STATUS, 0
+    RLF     DESIRED_TEMP, F ; x10
+    
+    ; Birler basamağını ekle
+    MOVF    W_TEMP, W
+    ADDWF   DESIRED_TEMP, F
+
+FINISH_INPUT:
+    ; --- ÇIKIŞ TEMİZLİĞİ ---
+    BANKSEL PORTD
+    BCF     PORTD, 7    ; Debug ışığını söndür (İş bitti)
+    
+    BANKSEL PORTB
+    CLRF    PORTB       ; ÖNEMLİ: Tüm sütunları 0 yap ki tekrar Interrupt oluşabilsin!
+    
+    BANKSEL INTCON
+    BCF     INTCON, 1   ; INTF temizle
+    BCF     ENTRY_MODE, 0 ; Modu kapat
+    RETURN
+
+WAIT_RELEASE_KEY:
+    CALL    SCAN_KEYPAD
+    XORLW   0xFF
+    BTFSS   STATUS, 2
+    GOTO    WAIT_RELEASE_KEY
+    RETURN
+; ---------------- KEYPAD TABLOSU ----------------
+; ---------------- DÜZELTİLMİŞ KEYPAD TABLOSU ----------------
+GET_KEY_CODE:
+    ; --- KRİTİK DÜZELTME: PCLATH AYARI ---
+    ; Tablonun nerede olduğunu işlemciye hatırlatmazsak kod patlar!
+    MOVWF   W_TEMP        ; W'yi (index) sakla
+    MOVLW   HIGH TABLE_START ; Tablonun yüksek adresini al
+    MOVWF   PCLATH        ; PCLATH'a yükle
+    MOVF    W_TEMP, W     ; W'yi geri al
+    
+TABLE_START:
+    ADDWF   PCL, F        ; Şimdi güvenle atlayabiliriz
+    
+    ; Standart 4x4 Keypad değerleri
+    RETLW   '1' ; 0
+    RETLW   '2' ; 1
+    RETLW   '3' ; 2
+    RETLW   'A' ; 3
+    RETLW   '4' ; 4
+    RETLW   '5' ; 5
+    RETLW   '6' ; 6
+    RETLW   'B' ; 7
+    RETLW   '7' ; 8
+    RETLW   '8' ; 9
+    RETLW   '9' ; 10
+    RETLW   'C' ; 11
+    RETLW   '*' ; 12
+    RETLW   '0' ; 13
+    RETLW   '#' ; 14
+    RETLW   'D' ; 15
+    RETLW   0xFF ; Hata
+    
+    ; ---------------- TUŞ TARAMA (SCAN) ----------------
+SCAN_KEYPAD:
+    ; Tüm Sütunları 1 yap
+    BANKSEL PORTB
+    MOVLW   0xF0
+    MOVWF   PORTB
+    
+    ; --- Sütun 1'i (RB4) 0 yap, Satırları Oku ---
+    BCF     PORTB, 4
+    BTFSS   PORTB, 0    ; Row 1 (RB0) 0 mı? -> Tuş '1'
+    RETLW   0
+    BTFSS   PORTB, 1    ; Row 2 (RB1) 0 mı? -> Tuş '4'
+    RETLW   4
+    BTFSS   PORTB, 2    ; Row 3 (RB2) 0 mı? -> Tuş '7'
+    RETLW   8
+    BTFSS   PORTB, 3    ; Row 4 (RB3) 0 mı? -> Tuş '*'
+    RETLW   12
+    BSF     PORTB, 4    ; Sütunu geri 1 yap
+
+    ; --- Sütun 2'yi (RB5) 0 yap, Satırları Oku ---
+    BCF     PORTB, 5
+    BTFSS   PORTB, 0    ; Row 1 -> '2'
+    RETLW   1
+    BTFSS   PORTB, 1    ; Row 2 -> '5'
+    RETLW   5
+    BTFSS   PORTB, 2    ; Row 3 -> '8'
+    RETLW   9
+    BTFSS   PORTB, 3    ; Row 4 -> '0'
+    RETLW   13
+    BSF     PORTB, 5
+
+    ; --- Sütun 3'ü (RB6) 0 yap ---
+    BCF     PORTB, 6
+    BTFSS   PORTB, 0    ; '3'
+    RETLW   2
+    BTFSS   PORTB, 1    ; '6'
+    RETLW   6
+    BTFSS   PORTB, 2    ; '9'
+    RETLW   10
+    BTFSS   PORTB, 3    ; '#'
+    RETLW   14
+    BSF     PORTB, 6
+
+    ; --- Sütun 4'ü (RB7) 0 yap ---
+    BCF     PORTB, 7
+    BTFSS   PORTB, 0    ; 'A'
+    RETLW   3
+    BTFSS   PORTB, 1    ; 'B'
+    RETLW   7
+    BTFSS   PORTB, 2    ; 'C'
+    RETLW   11
+    BTFSS   PORTB, 3    ; 'D'
+    RETLW   15
+    BSF     PORTB, 7
+
+    ; Hiçbir tuşa basılmadıysa
+    RETLW   0xFF
+    END
