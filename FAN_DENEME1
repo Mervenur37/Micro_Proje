@@ -1,0 +1,303 @@
+; =====================================================
+; AKILLI EV – BOARD 1 (DISPLAY SCAN FIX)
+; =====================================================
+
+#include <xc.inc>
+
+; ---------------- CONFIG ----------------
+CONFIG FOSC = HS
+CONFIG WDTE = OFF
+CONFIG PWRTE = ON
+CONFIG BOREN = ON
+CONFIG LVP = OFF
+CONFIG CPD = OFF
+CONFIG WRT = OFF
+CONFIG CP = OFF
+
+; ---------------- RAM ----------------
+PSECT udata_shr
+W_TEMP:         DS 1
+STATUS_TEMP:    DS 1
+DIGIT_TEMP:     DS 1    ; Tarama için geçici saklama
+
+PSECT udata_bank0
+DIGIT_VAR:      DS 1
+DISP1:          DS 1    ; Onlar
+DISP2:          DS 1    ; Birler
+DISP3:          DS 1    ; Ondalık
+DISP4:          DS 1    ; C Harfi
+TEMP_RAW:       DS 1
+TEMP_CALIB:     DS 1
+TEMP_OFFSET:    DS 1
+ADC_LOW:        DS 1
+; Mevcut degiskenlerinin altina bunu ekle:
+REQ_DESIRED_TEMP:   DS 1    ; Istenen Sicaklik (Sabit test icin)
+
+; ---------------- RESET ----------------
+PSECT code, delta=2, abs
+ORG 0x0000
+    GOTO MAIN
+
+; ---------------- INTERRUPT ----------------
+PSECT code, delta=2, abs
+ORG 0x0004
+ISR:
+    MOVWF   W_TEMP
+    SWAPF   STATUS, W
+    MOVWF   STATUS_TEMP
+
+    BCF     STATUS, 5       ; Bank 0
+    BCF     STATUS, 6
+
+    BCF     INTCON, 2       ; T0IF Temizle
+    CALL    REFRESH_DISPLAY
+    MOVLW   100
+    MOVWF   TMR0
+
+    SWAPF   STATUS_TEMP, W
+    MOVWF   STATUS
+    SWAPF   W_TEMP, F
+    SWAPF   W_TEMP, W
+    RETFIE
+
+; ---------------- 7-SEGMENT TABLOSU ----------------
+PSECT code, delta=2, abs
+ORG 0x0200
+
+GET_7SEG:
+    ANDLW   0x0F
+    ADDWF   PCL, F
+
+    ; Common Cathode (1 = YANAR)
+    RETLW   00111111B ; 0
+    RETLW   00000110B ; 1
+    RETLW   01011011B ; 2
+    RETLW   01001111B ; 3
+    RETLW   01100110B ; 4
+    RETLW   01101101B ; 5
+    RETLW   01111101B ; 6
+    RETLW   00000111B ; 7
+    RETLW   01111111B ; 8
+    RETLW   01101111B ; 9
+    RETLW   00111001B ; C (10)
+    RETLW   01100011B ; Derece (11)
+    RETLW   00000000B ; Boş
+
+; ---------------- MAIN ----------------
+PSECT code
+MAIN:
+    ; PORT AYARLARI
+    BANKSEL TRISD
+    CLRF    TRISD
+    CLRF    TRISE
+    CLRF    TRISA
+    BSF     TRISA, 0        ; RA0 Analog
+
+    ; ADC AYARI
+    MOVLW   10001110B       
+    MOVWF   ADCON1
+    BANKSEL ADCON0
+    MOVLW   10000001B       ; ADC Açık
+    MOVWF   ADCON0
+
+    ; TIMER AYARLARI
+    BANKSEL OPTION_REG
+    MOVLW   10000100B       ; Prescaler 1:32
+    MOVWF   OPTION_REG
+    BANKSEL INTCON
+    MOVLW   10100000B       ; Kesmeler Açık
+    MOVWF   INTCON
+
+    BANKSEL PORTD
+    CLRF    DIGIT_VAR
+    
+    MOVLW   10              ; 'C' harfi
+    MOVWF   DISP4
+    ; ... (Ayarlar bittikten sonra) ...
+    CLRF    DIGIT_VAR
+    
+    MOVLW   10              ; 'C' harfi
+    MOVWF   DISP4
+
+    ; --- YENI EKLENEN KISIM ---
+    MOVLW   25              ; Hedef sicaklik 25 derece olsun
+    MOVWF   REQ_DESIRED_TEMP
+    ; --------------------------
+
+MAIN_LOOP:
+    CALL    READ_ADC
+    CALL    SPLIT_DIGITS
+    CALL    CHECK_TEMP_CONTROL
+    CALL    DELAY_SMALL
+    GOTO    MAIN_LOOP
+
+; ---------------- ADC OKUMA & HESAP ----------------
+READ_ADC:
+    BANKSEL ADCON0
+    BSF     ADCON0, 2
+WAIT_ADC:
+    BTFSC   ADCON0, 2
+    GOTO    WAIT_ADC
+
+    BANKSEL ADRESL
+    MOVF    ADRESL, W
+    BANKSEL ADC_LOW
+    MOVWF   TEMP_RAW
+
+    ; Kalibrasyon (Değer - Değer/32)
+    MOVF    TEMP_RAW, W
+    MOVWF   TEMP_OFFSET
+    SWAPF   TEMP_OFFSET, F
+    MOVLW   0x0F
+    ANDWF   TEMP_OFFSET, F
+    BCF     STATUS, 0
+    RRF     TEMP_OFFSET, F
+    
+    MOVF    TEMP_OFFSET, W
+    SUBWF   TEMP_RAW, W
+    MOVWF   TEMP_CALIB
+
+    ; Tam Sayı
+    MOVF    TEMP_CALIB, W
+    MOVWF   TEMP_RAW
+    BCF     STATUS, 0
+    RRF     TEMP_RAW, F
+    
+    ; Ondalık Kısım (0 veya 5)
+    CLRF    DISP3           ; Önce 0 yap
+    BTFSC   TEMP_CALIB, 0   ; Tek sayı mı?
+    MOVLW   5               ; Evetse 5 yükle
+    BTFSC   TEMP_CALIB, 0
+    MOVWF   DISP3           ; Kaydet
+
+    RETURN
+
+; ---------------- BASAMAKLARA AYIRMA ----------------
+SPLIT_DIGITS:
+    CLRF    DISP1
+    MOVF    TEMP_RAW, W
+
+DIV10:
+    ADDLW   -10
+    BTFSS   STATUS, 0
+    GOTO    DONE_DIV
+    INCF    DISP1, F
+    GOTO    DIV10
+
+DONE_DIV:
+    ADDLW   10
+    MOVWF   DISP2
+    RETURN
+
+; ---------------- EKRAN TARAMA (DÜZELTİLDİ) ----------------
+REFRESH_DISPLAY:
+    ; Digitleri Kapat
+    BCF     PORTE, 0
+    BCF     PORTE, 1
+    BCF     PORTE, 2
+    BCF     PORTA, 5
+
+    MOVLW   0x02
+    MOVWF   PCLATH
+
+    ; --- YENİ SEÇME MANTIĞI (BUG FIX) ---
+    MOVF    DIGIT_VAR, W
+    ANDLW   0x03           ; Sadece 0-3 arası
+    MOVWF   DIGIT_TEMP     ; Sakla
+
+    ; 0 mı? (Onlar)
+    MOVF    DIGIT_TEMP, W
+    XORLW   0
+    BTFSC   STATUS, 2      ; Z=1 ise eşittir
+    GOTO    SHOW_1
+
+    ; 1 mi? (Birler)
+    MOVF    DIGIT_TEMP, W
+    XORLW   1
+    BTFSC   STATUS, 2
+    GOTO    SHOW_2
+
+    ; 2 mi? (Ondalık - SORUN BURADAYDI)
+    MOVF    DIGIT_TEMP, W
+    XORLW   2
+    BTFSC   STATUS, 2
+    GOTO    SHOW_3
+
+    ; 3 mü? (C harfi)
+    GOTO    SHOW_4
+
+SHOW_1: ; Onlar
+    MOVF    DISP1, W
+    CALL    GET_7SEG
+    MOVWF   PORTD
+    BSF     PORTE, 0
+    INCF    DIGIT_VAR, F
+    GOTO    FINISH
+
+SHOW_2: ; Birler + NOKTA
+    MOVF    DISP2, W
+    CALL    GET_7SEG
+    IORLW   10000000B      ; Noktayı yak
+    MOVWF   PORTD
+    BSF     PORTE, 1
+    INCF    DIGIT_VAR, F
+    GOTO    FINISH
+
+SHOW_3: ; Ondalık (Artık Çalışacak!)
+    MOVF    DISP3, W
+    CALL    GET_7SEG
+    MOVWF   PORTD
+    BSF     PORTE, 2       ; RE2'yi yak
+    INCF    DIGIT_VAR, F
+    GOTO    FINISH
+
+SHOW_4: ; C Harfi
+    MOVF    DISP4, W
+    CALL    GET_7SEG
+    MOVWF   PORTD
+    BSF     PORTA, 5
+    CLRF    DIGIT_VAR
+    GOTO    FINISH
+
+FINISH:
+    CLRF    PCLATH
+    RETURN
+
+; ---------------- GECİKME ----------------
+DELAY_SMALL:
+    MOVLW   50
+    MOVWF   W_TEMP
+DLY:
+    DECFSZ  W_TEMP, F
+    GOTO    DLY
+    RETURN
+; ---------------- KLIMA KONTROL MANTIGI (DUZELTILDI) ----------------
+CHECK_TEMP_CONTROL:
+    BANKSEL PORTC           ; PORTC bankina gec (Cikislar icin)
+    
+    ; --- DUZELTME BURADA ---
+    ; TEMP_CALIB degil, TEMP_RAW kullanacagiz.
+    ; Cunku TEMP_RAW, READ_ADC fonksiyonundan cikarken gercek dereceyi (orn: 25) tutuyor.
+    
+    MOVF    REQ_DESIRED_TEMP, W ; W = 25
+    SUBWF   TEMP_RAW, W         ; W = Gercek Sicaklik - 25
+    
+    ; Eger Sonuc Pozitif (C=1) ise: Ortam >= Hedef -> SOGUTUCU AC
+    ; Eger Sonuc Negatif (C=0) ise: Ortam < Hedef  -> ISITICI AC
+    
+    BTFSS   STATUS, 0       ; Carry (C) biti kontrolu
+    GOTO    TURN_ON_HEATER  ; C=0 ise sonuc negatiftir (Ortam soguk)
+
+TURN_ON_COOLER:
+    ; Ortam sicak (veya esit), sogutucuyu ac (RC1), isiticiyi kapat (RC0)
+    BCF     PORTC, 0        ; Isitici Kapat
+    BSF     PORTC, 1        ; Sogutucu AC (Fan Donmeli)
+    RETURN
+
+TURN_ON_HEATER:
+    ; Ortam soguk, isiticiyi ac (RC0), sogutucuyu kapat (RC1)
+    BCF     PORTC, 1        ; Sogutucu Kapat
+    BSF     PORTC, 0        ; Isitici AC (Sicaklik Artmali)
+    RETURN
+
+    END
